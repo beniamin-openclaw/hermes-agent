@@ -36,10 +36,6 @@ class NousProfile(ProviderProfile):
         reasoning = policy["reasoning"]
         return ({"reasoning": reasoning} if reasoning is not None else {}), {}
 
-    def get_max_tokens(self, model: str | None) -> int | None:
-        return nous_request_policy(model=model)["max_tokens"]
-
-
 nous = NousProfile(
     name="nous",
     aliases=("nous-portal", "nousresearch"),

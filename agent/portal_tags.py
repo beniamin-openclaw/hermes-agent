@@ -88,9 +88,14 @@ def nous_request_policy(
 
     max_tokens = None
     try:
-        from agent.anthropic_adapter import _get_anthropic_max_output
+        from agent.anthropic_adapter import (
+            _ANTHROPIC_OUTPUT_LIMITS,
+            _get_anthropic_max_output,
+        )
 
-        max_tokens = _get_anthropic_max_output(model or "")
+        model_norm = (model or "").lower().replace(".", "-")
+        if any(key in model_norm for key in _ANTHROPIC_OUTPUT_LIMITS):
+            max_tokens = _get_anthropic_max_output(model or "")
     except Exception:
         max_tokens = None
 

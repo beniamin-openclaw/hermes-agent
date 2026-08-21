@@ -407,6 +407,58 @@ def test_isolated_nous_request_policy_matches_profile_without_discovery(
     assert requests[0]["max_tokens"] == _get_anthropic_max_output("anthropic/claude-sonnet-4.6")
 
 
+def test_isolated_hermes_model_omits_anthropic_output_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import run_agent
+
+    requests, constructions, closes = _install_fake_provider(monkeypatch)
+    agent = run_agent.AIAgent(
+        api_key="fixture-key",
+        base_url="https://inference.nousresearch.com/v1",
+        provider="nous",
+        api_mode="chat_completions",
+        model="hermes-3-llama-3.1-405b",
+        fallback_model=[],
+        session_db=None,
+        skip_context_files=True,
+        skip_memory=True,
+        isolated_oneshot=True,
+    )
+
+    result = agent.run_conversation("review prompt")
+
+    assert result["completed"] is True
+    assert len(requests) == len(constructions) == len(closes) == 1
+    assert "max_tokens" not in requests[0]
+
+
+def test_isolated_explicit_max_tokens_wins_over_policy_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import run_agent
+
+    requests, _constructions, _closes = _install_fake_provider(monkeypatch)
+    agent = run_agent.AIAgent(
+        api_key="fixture-key",
+        base_url="https://inference.nousresearch.com/v1",
+        provider="nous",
+        api_mode="chat_completions",
+        model="anthropic/claude-sonnet-4.6",
+        max_tokens=4096,
+        fallback_model=[],
+        session_db=None,
+        skip_context_files=True,
+        skip_memory=True,
+        isolated_oneshot=True,
+    )
+
+    result = agent.run_conversation("review prompt")
+
+    assert result["completed"] is True
+    assert requests[0]["max_tokens"] == 4096
+
+
 @pytest.mark.parametrize("response_shape", ["whitespace", "missing_content"])
 def test_isolated_empty_normalized_response_is_failed_with_usage_receipt(
     tmp_path: Path,
