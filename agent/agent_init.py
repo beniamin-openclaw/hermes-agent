@@ -257,6 +257,226 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _init_isolated_agent(
+    agent,
+    *,
+    base_url: str,
+    api_key: str,
+    provider: str,
+    api_mode: str,
+    model: str,
+    max_iterations: int,
+    tool_delay: float,
+    ephemeral_system_prompt: str | None,
+    session_id: str | None,
+    callbacks: Dict[str, Any],
+    max_tokens: int | None,
+    reasoning_config: Dict[str, Any] | None,
+    service_tier: str | None,
+    request_overrides: Dict[str, Any] | None,
+    prefill_messages: List[Dict[str, Any]] | None,
+    platform: str | None,
+    user_id: str | None,
+    user_id_alt: str | None,
+    user_name: str | None,
+    chat_id: str | None,
+    chat_name: str | None,
+    chat_type: str | None,
+    thread_id: str | None,
+    gateway_session_key: str | None,
+    iteration_budget: "IterationBudget" | None,
+    credential_pool: Any,
+    skip_context_files: bool,
+    load_soul_identity: bool,
+    pass_session_id: bool,
+) -> None:
+    """Initialize the deliberately narrow one-turn agent contract.
+
+    This path is intentionally independent of the ordinary startup graph. It
+    does not discover tools or plugins, probe the environment, open a session
+    database, construct a context engine, or resolve credentials. The normal
+    provider transport remains the only inference seam used after this state
+    is installed.
+    """
+    _install_safe_stdio()
+
+    agent.isolated_oneshot = True
+    agent.model = model
+    agent.max_iterations = max_iterations
+    agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+    agent.tool_delay = tool_delay
+    agent.save_trajectories = False
+    agent.verbose_logging = False
+    agent.quiet_mode = True
+    agent.tool_progress_mode = "none"
+    agent.ephemeral_system_prompt = ephemeral_system_prompt
+    agent.platform = platform or "cli"
+    agent._user_id = user_id
+    agent._user_id_alt = user_id_alt
+    agent._user_name = user_name
+    agent._chat_id = chat_id
+    agent._chat_name = chat_name
+    agent._chat_type = chat_type
+    agent._thread_id = thread_id
+    agent._gateway_session_key = gateway_session_key
+    agent._print_fn = None
+    agent.background_review_callback = None
+    agent.memory_notifications = "off"
+    agent.skip_context_files = skip_context_files
+    agent.load_soul_identity = load_soul_identity
+    agent.pass_session_id = pass_session_id
+    agent._credential_pool = credential_pool
+    agent.log_prefix_chars = 100
+    agent.log_prefix = ""
+
+    agent.base_url = base_url or ""
+    agent.provider = (provider or "").strip().lower()
+    agent.api_mode = api_mode or "chat_completions"
+    agent.api_key = api_key or ""
+    agent.acp_command = None
+    agent.acp_args = []
+
+    # A single request is always toolless. Keeping the complete tool state
+    # empty also makes accidental discovery visible to callers and tests.
+    agent.enabled_toolsets = []
+    agent.disabled_toolsets = []
+    agent.tools = []
+    agent.valid_tool_names = set()
+    agent._tool_snapshot_generation = 0
+    agent._context_engine_tool_names = set()
+    agent._environment_probe = False
+    agent._skip_mcp_refresh = True
+    agent._tool_guardrails = None
+    agent._tool_guardrail_halt_decision = None
+    agent._executing_tools = False
+
+    # No persistence, memory, context, checkpoints, or fallback machinery is
+    # part of an isolated turn. These explicit sentinels prevent lazy helpers
+    # from opening those surfaces if a future call site touches them.
+    agent._session_db = None
+    agent._session_db_created = False
+    agent._persist_disabled = True
+    agent._end_session_on_close = False
+    agent.session_id = session_id or "isolated-oneshot"
+    agent.session_start = datetime.now()
+    agent._session_messages = []
+    agent._cached_system_prompt = None
+    agent.context_compressor = None
+    agent._memory_store = None
+    agent._memory_manager = None
+    agent._memory_enabled = False
+    agent._user_profile_enabled = False
+    agent._session_json_enabled = False
+    agent._checkpoint_mgr = None
+    agent._todo_store = None
+    agent._fallback_chain = []
+    agent._fallback_index = 0
+    agent._fallback_activated = False
+    agent._fallback_model = None
+
+    agent.providers_allowed = None
+    agent.providers_ignored = None
+    agent.providers_order = None
+    agent.provider_sort = None
+    agent.provider_require_parameters = False
+    agent.provider_data_collection = None
+    agent.openrouter_min_coding_score = None
+    agent.max_tokens = max_tokens
+    agent.reasoning_config = reasoning_config
+    agent.service_tier = service_tier
+    agent.request_overrides = dict(request_overrides or {})
+    agent.prefill_messages = list(prefill_messages or [])
+    agent._force_ascii_payload = False
+    agent._ephemeral_max_output_tokens = None
+    agent._ollama_num_ctx = None
+    agent._config_context_length = None
+
+    # Keep the existing OpenAI-compatible request/client seam. Client
+    # construction stays lazy until the one allowed inference request.
+    agent._client_kwargs = {
+        "api_key": agent.api_key,
+        "base_url": agent.base_url,
+    }
+    agent.client = None
+    agent._anthropic_client = None
+    agent._is_anthropic_oauth = False
+    agent._transport_cache = {}
+    agent._anthropic_base_url = None
+    agent._oauth_1m_beta_disabled = False
+    agent._client_lock = threading.RLock()
+
+    agent._use_prompt_caching = False
+    agent._use_native_cache_layout = False
+    agent._cache_ttl = "5m"
+    agent.compression_enabled = False
+    agent.compression_in_place = False
+    agent._compression_feasibility_checked = True
+    agent._compression_warning = None
+    agent._primary_runtime = {}
+
+    # Callbacks are retained only as inert compatibility state; the isolated
+    # conversation helper does not invoke lifecycle, tool, or hook callbacks.
+    for name, value in callbacks.items():
+        setattr(agent, name, value)
+    agent.suppress_status_output = True
+
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._execution_thread_id = None
+    agent._interrupt_thread_signal_pending = False
+    agent._pending_steer = None
+    agent._pending_steer_lock = threading.Lock()
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent._tool_worker_threads = set()
+    agent._tool_worker_threads_lock = threading.Lock()
+    agent._delegate_depth = 0
+
+    agent._stream_callback = None
+    agent.stream_delta_callback = None
+    agent._stream_needs_break = False
+    agent._disable_streaming = True
+    agent._response_was_previewed = False
+    agent._current_streamed_assistant_text = ""
+    agent._current_api_request_id = ""
+    agent._api_call_count = 0
+    agent._api_max_retries = 1
+    agent._rate_limit_state = None
+    agent._credits_state = None
+    agent._credits_session_start_micros = None
+    agent._credits_latch = {"active": set(), "seen_below_90": False, "usage_band": None}
+    agent._or_cache_hits = 0
+    agent._last_activity_ts = time.time()
+    agent._last_activity_desc = "isolated initialization"
+    agent._current_tool = None
+    agent._budget_exhausted_injected = False
+    agent._budget_grace_call = False
+    agent._auth_pool_refresh_counts = {}
+
+    # Result accounting is in-memory only. No ledger/session writes happen on
+    # this path.
+    for name in (
+        "session_total_tokens",
+        "session_input_tokens",
+        "session_output_tokens",
+        "session_prompt_tokens",
+        "session_completion_tokens",
+        "session_cache_read_tokens",
+        "session_cache_write_tokens",
+        "session_reasoning_tokens",
+        "session_api_calls",
+    ):
+        setattr(agent, name, 0)
+    agent.session_estimated_cost_usd = 0.0
+    agent.session_cost_status = "unknown"
+    agent.session_cost_source = "none"
+    agent._session_init_model_config = {
+        "model": agent.model,
+        "provider": agent.provider,
+        "api_mode": agent.api_mode,
+    }
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -324,6 +544,7 @@ def init_agent(
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
+    isolated_oneshot: bool = False,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
     checkpoint_max_total_size_mb: int = 500,
@@ -379,6 +600,56 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    if isolated_oneshot:
+        _init_isolated_agent(
+            agent,
+            base_url=base_url or "",
+            api_key=api_key or "",
+            provider=provider or "",
+            api_mode=api_mode or "chat_completions",
+            model=model,
+            max_iterations=max_iterations,
+            tool_delay=tool_delay,
+            ephemeral_system_prompt=ephemeral_system_prompt,
+            session_id=session_id,
+            callbacks={
+                "tool_progress_callback": tool_progress_callback,
+                "tool_start_callback": tool_start_callback,
+                "tool_complete_callback": tool_complete_callback,
+                "thinking_callback": thinking_callback,
+                "reasoning_callback": reasoning_callback,
+                "clarify_callback": clarify_callback,
+                "read_terminal_callback": read_terminal_callback,
+                "step_callback": step_callback,
+                "interim_assistant_callback": interim_assistant_callback,
+                "tool_gen_callback": tool_gen_callback,
+                "status_callback": status_callback,
+                "notice_callback": notice_callback,
+                "notice_clear_callback": notice_clear_callback,
+                "event_callback": event_callback,
+            },
+            max_tokens=max_tokens,
+            reasoning_config=reasoning_config,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
+            prefill_messages=prefill_messages,
+            platform=platform,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            user_name=user_name,
+            chat_id=chat_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            gateway_session_key=gateway_session_key,
+            iteration_budget=iteration_budget,
+            credential_pool=credential_pool,
+            skip_context_files=skip_context_files,
+            load_soul_identity=load_soul_identity,
+            pass_session_id=pass_session_id,
+        )
+        return
+
     _install_safe_stdio()
 
     agent.model = model

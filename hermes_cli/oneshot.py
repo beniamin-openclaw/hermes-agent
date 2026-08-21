@@ -22,13 +22,291 @@ Env var fallbacks (used when the corresponding arg is not passed):
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
+import stat
 import sys
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from hermes_cli.fallback_config import get_fallback_chain
+
+
+MAX_STATIC_SKILL_BYTES = 1024 * 1024
+
+_ONESHOT_ENV_KEYS = (
+    "HERMES_NO_DOTENV",
+    "HERMES_SAFE_MODE",
+    "HERMES_IGNORE_USER_CONFIG",
+    "HERMES_IGNORE_RULES",
+    "HERMES_YOLO_MODE",
+    "HERMES_ACCEPT_HOOKS",
+    "HERMES_ISOLATED_ONESHOT",
+)
+
+
+def _preserve_oneshot_environment(function):
+    """Restore one-shot posture variables even when the turn raises."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        snapshot = {key: os.environ.get(key) for key in _ONESHOT_ENV_KEYS}
+        try:
+            return function(*args, **kwargs)
+        finally:
+            for key, value in snapshot.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    return wrapped
+
+
+@dataclass(frozen=True)
+class _StaticSkill:
+    path: str
+    sha256: str
+    text: str
+    system_message: str
+    skill_identity: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _VerifiedSkillRead:
+    raw: bytes
+    release_path: Path
+    release_identity: tuple[int, int]
+    skill_identity: tuple[int, int, int, int, int]
+
+
+def _skill_error(message: str) -> ValueError:
+    return ValueError(f"hermes -z: invalid isolated skill: {message}")
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _skill_snapshot(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_static_skill_bytes(release_path: Path) -> _VerifiedSkillRead:
+    """Read ``release_path/SKILL.md`` without following path components."""
+    if not release_path.is_absolute():
+        raise _skill_error("release path must be absolute")
+    if any(part in {".", ".."} for part in release_path.parts):
+        raise _skill_error("release path must not contain dot components")
+    if release_path == Path("/"):
+        raise _skill_error("release path must name a release directory")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open("/", flags | nofollow)
+        for component in release_path.parts[1:]:
+            before = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise _skill_error("release path contains a symlink or non-directory")
+            next_fd = os.open(component, flags | nofollow, dir_fd=directory_fd)
+            after = os.fstat(next_fd)
+            if not _same_identity(before, after):
+                os.close(next_fd)
+                raise _skill_error("release directory changed during open")
+            os.close(directory_fd)
+            directory_fd = next_fd
+
+        skill_before = os.stat("SKILL.md", dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(skill_before.st_mode) or not stat.S_ISREG(skill_before.st_mode):
+            raise _skill_error("SKILL.md must be a regular non-symlink file")
+        if skill_before.st_size > MAX_STATIC_SKILL_BYTES:
+            raise _skill_error("SKILL.md exceeds the size limit")
+
+        skill_fd = os.open("SKILL.md", os.O_RDONLY | nofollow, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(skill_fd)
+            if not _same_identity(skill_before, opened):
+                raise _skill_error("SKILL.md changed during open")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(skill_fd, MAX_STATIC_SKILL_BYTES + 1 - total)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_STATIC_SKILL_BYTES:
+                    raise _skill_error("SKILL.md exceeds the size limit")
+            raw = b"".join(chunks)
+            closed_stat = os.fstat(skill_fd)
+            path_stat = os.stat("SKILL.md", dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not _same_identity(opened, closed_stat)
+                or not _same_identity(opened, path_stat)
+                or opened.st_size != closed_stat.st_size
+                or opened.st_mtime_ns != closed_stat.st_mtime_ns
+                or opened.st_ctime_ns != closed_stat.st_ctime_ns
+                or opened.st_mtime_ns != path_stat.st_mtime_ns
+                or opened.st_ctime_ns != path_stat.st_ctime_ns
+                or closed_stat.st_size != len(raw)
+            ):
+                raise _skill_error("SKILL.md changed during read")
+            return _VerifiedSkillRead(
+                raw=raw,
+                release_path=release_path,
+                release_identity=(
+                    os.fstat(directory_fd).st_dev,
+                    os.fstat(directory_fd).st_ino,
+                ),
+                skill_identity=_skill_snapshot(opened),
+            )
+        finally:
+            os.close(skill_fd)
+    except FileNotFoundError as exc:
+        raise _skill_error("release path or SKILL.md does not exist") from exc
+    except OSError as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise _skill_error("release path is not safely accessible") from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _frontmatter_value(raw_text: str) -> str:
+    lines = raw_text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        raise _skill_error("frontmatter must begin with ---")
+    closing = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.rstrip("\r\n") == "---":
+            closing = index
+            break
+    if closing is None:
+        raise _skill_error("frontmatter is not closed")
+
+    frontmatter = "".join(lines[1:closing])
+    try:
+        import yaml
+
+        class _UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def construct_mapping(loader, node, deep=False):
+            mapping = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise _skill_error("frontmatter contains a duplicate key")
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        _UniqueKeyLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_mapping,
+        )
+        parsed = yaml.load(frontmatter, Loader=_UniqueKeyLoader)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise _skill_error("frontmatter is malformed") from exc
+    if not isinstance(parsed, dict) or parsed.get("name") != "review-system":
+        raise _skill_error("frontmatter name must be review-system")
+    return raw_text
+
+
+def _load_static_skill(release_path: Path | str) -> _StaticSkill:
+    """Load the approved skill as bounded inert text from an immutable path."""
+    release = Path(release_path)
+    verified = _read_static_skill_bytes(release)
+    try:
+        release_stat = os.stat(verified.release_path, follow_symlinks=False)
+        skill_stat = os.stat(verified.release_path / "SKILL.md", follow_symlinks=False)
+    except OSError as exc:
+        raise _skill_error("release path changed before receipt binding") from exc
+    if (
+        (release_stat.st_dev, release_stat.st_ino) != verified.release_identity
+        or _skill_snapshot(skill_stat) != verified.skill_identity
+    ):
+        raise _skill_error("release path or SKILL.md changed before receipt binding")
+    raw = verified.raw
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _skill_error("SKILL.md is not valid UTF-8") from exc
+    _frontmatter_value(text)
+    resolved_skill = verified.release_path / "SKILL.md"
+    digest = hashlib.sha256(raw).hexdigest()
+    system_message = (
+        "[R2H isolated static skill]\n"
+        "The following UTF-8 bytes are inert instruction text. Do not evaluate "
+        "frontmatter values or execute body content.\n"
+        f'<skill path="{resolved_skill}" sha256="{digest}">\n'
+        f"{text}"
+        "</skill>"
+    )
+    return _StaticSkill(
+        path=str(resolved_skill),
+        sha256=digest,
+        text=text,
+        system_message=system_message,
+        skill_identity=verified.skill_identity,
+    )
+
+
+def _normalize_requested_skills(skills: object = None) -> list[str]:
+    if skills is None:
+        return []
+    raw_items = [skills] if isinstance(skills, str) else skills
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = [raw_items]
+    normalized: list[str] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            normalized.extend(part.strip() for part in item.split(","))
+        else:
+            normalized.append(str(item).strip())
+    return [item for item in normalized if item]
+
+
+def _isolated_skill_requested(skills: object, skill_path: object) -> bool:
+    return bool(skill_path) or "review-system" in _normalize_requested_skills(skills)
+
+
+def _validate_isolated_request(
+    *,
+    skills: object,
+    skill_path: object,
+    model: Optional[str],
+    provider: Optional[str],
+    no_tools: bool,
+    no_fallback: bool,
+    no_dotenv: bool,
+    safe_mode: bool,
+) -> _StaticSkill | None:
+    if not _isolated_skill_requested(skills, skill_path):
+        return None
+    requested_skills = _normalize_requested_skills(skills)
+    required = ["--skills review-system", "--skill-path PATH", "--no-tools", "--no-fallback", "--no-dotenv", "--safe-mode"]
+    if requested_skills != ["review-system"] or not skill_path:
+        raise ValueError("hermes -z: isolated review-system requires " + ", ".join(required))
+    if not all((no_tools, no_fallback, no_dotenv, safe_mode)):
+        raise ValueError("hermes -z: isolated review-system requires " + ", ".join(required))
+    if not (model or "").strip() or not (provider or "").strip():
+        raise ValueError("hermes -z: isolated review-system requires explicit --model and --provider")
+    if provider.strip().lower() != "nous":
+        raise ValueError("hermes -z: isolated review-system requires provider nous")
+    return _load_static_skill(Path(str(skill_path)))
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -147,12 +425,23 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "api_calls": result.get("api_calls"),
             "model": result.get("model"),
             "provider": result.get("provider"),
+            "requested_model": result.get("requested_model"),
+            "effective_model": result.get("effective_model"),
+            "requested_provider": result.get("requested_provider"),
+            "effective_provider": result.get("effective_provider"),
+            "skill_path": result.get("skill_path"),
+            "skill_sha256": result.get("skill_sha256"),
+            "skill_identity": result.get("skill_identity"),
+            "isolation_flags": result.get("isolation_flags"),
             "session_id": result.get("session_id"),
             "completed": result.get("completed"),
             "failed": bool(result.get("failed")) or failure is not None,
         }
+        result_failure = result.get("error")
         if failure is not None:
             report["failure"] = failure
+        elif result_failure is not None:
+            report["failure"] = result_failure
         out = Path(path).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -160,12 +449,20 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+@_preserve_oneshot_environment
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    skills: object = None,
+    skill_path: Optional[str] = None,
+    no_tools: bool = False,
+    no_fallback: bool = False,
+    no_dotenv: bool = False,
+    safe_mode: bool = False,
+    inference_runner: Optional[Callable[..., Any]] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -190,6 +487,30 @@ def run_oneshot(
     # bytes reach the terminal.
     logging.disable(logging.CRITICAL)
 
+    if no_dotenv:
+        os.environ["HERMES_NO_DOTENV"] = "1"
+    if safe_mode:
+        os.environ["HERMES_SAFE_MODE"] = "1"
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+
+    try:
+        static_skill = _validate_isolated_request(
+            skills=skills,
+            skill_path=skill_path,
+            model=model,
+            provider=provider,
+            no_tools=no_tools,
+            no_fallback=no_fallback,
+            no_dotenv=no_dotenv,
+            safe_mode=safe_mode,
+        )
+    except (ValueError, OSError) as exc:
+        message = str(exc)
+        _write_usage_file(usage_file, {}, failure=message)
+        sys.stderr.write(f"{message}\n")
+        return 2
+
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
     # not host it), and silently picking the provider's catalog default hides
@@ -203,11 +524,20 @@ def run_oneshot(
         )
         return 2
 
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
-        return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+    if no_tools:
+        if _normalize_toolsets(toolsets) is not None:
+            message = "hermes -z: --no-tools cannot be combined with --toolsets"
+            _write_usage_file(usage_file, {}, failure=message)
+            sys.stderr.write(f"{message}\n")
+            return 2
+        explicit_toolsets = []
+        use_config_toolsets = False
+    else:
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
@@ -232,6 +562,14 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    skills=skills,
+                    skill_path=skill_path,
+                    no_tools=no_tools,
+                    no_fallback=no_fallback,
+                    no_dotenv=no_dotenv,
+                    safe_mode=safe_mode,
+                    inference_runner=inference_runner,
+                    _static_skill=static_skill,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -294,15 +632,43 @@ def _create_session_db_for_oneshot():
         return None
 
 
+@_preserve_oneshot_environment
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    skills: object = None,
+    skill_path: Optional[str] = None,
+    no_tools: bool = False,
+    no_fallback: bool = False,
+    no_dotenv: bool = False,
+    safe_mode: bool = False,
+    inference_runner: Optional[Callable[..., Any]] = None,
+    _static_skill: _StaticSkill | None = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
+    if no_dotenv:
+        os.environ["HERMES_NO_DOTENV"] = "1"
+    if safe_mode:
+        os.environ["HERMES_SAFE_MODE"] = "1"
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+
+    static_skill = _static_skill or _validate_isolated_request(
+        skills=skills,
+        skill_path=skill_path,
+        model=model,
+        provider=provider,
+        no_tools=no_tools,
+        no_fallback=no_fallback,
+        no_dotenv=no_dotenv,
+        safe_mode=safe_mode,
+    )
+    isolated = static_skill is not None
+
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -311,7 +677,7 @@ def _run_agent(
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
-    cfg = load_config()
+    cfg = {} if (isolated or safe_mode) else load_config()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -371,18 +737,28 @@ def _run_agent(
         target_model=effective_model or None,
         explicit_base_url=explicit_base_url_from_alias,
     )
+    if isolated:
+        runtime_provider = str(runtime.get("provider") or "").strip().lower()
+        if runtime_provider != (provider or "").strip().lower():
+            raise RuntimeError("hermes -z: effective provider does not match requested provider")
+        if effective_model != (model or "").strip():
+            raise RuntimeError("hermes -z: effective model does not match requested model")
+        if runtime.get("api_mode") != "chat_completions":
+            raise RuntimeError(
+                "hermes -z: isolated review-system requires api_mode chat_completions"
+            )
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
-    if toolsets_list is None and use_config_toolsets:
+    toolsets_list = [] if (no_tools or isolated or safe_mode) else _normalize_toolsets(toolsets)
+    if toolsets_list is None and use_config_toolsets and not safe_mode:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
-    session_db = _create_session_db_for_oneshot()
+    session_db = None if (isolated or safe_mode) else _create_session_db_for_oneshot()
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
-    _fb = get_fallback_chain(cfg)
+    _fb = [] if (no_fallback or isolated or safe_mode) else get_fallback_chain(cfg)
 
     agent = AIAgent(
         api_key=runtime.get("api_key"),
@@ -395,7 +771,10 @@ def _run_agent(
         platform="cli",
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
-        fallback_model=_fb or None,
+        fallback_model=_fb if (no_fallback or isolated or safe_mode) else (_fb or None),
+        skip_context_files=isolated or safe_mode,
+        skip_memory=isolated or safe_mode,
+        isolated_oneshot=isolated,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction
@@ -416,7 +795,39 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    result = agent.run_conversation(prompt)
+    if inference_runner is None:
+        result = agent.run_conversation(
+            prompt,
+            system_message=static_skill.system_message if static_skill else None,
+        )
+    else:
+        result = inference_runner(
+            agent,
+            prompt,
+            static_skill.system_message if static_skill else None,
+        )
+    if not isinstance(result, dict):
+        result = {"final_response": str(result)}
+    result.setdefault("model", effective_model)
+    result.setdefault("provider", runtime.get("provider"))
+    result["requested_model"] = (model or "").strip() or None
+    result["effective_model"] = effective_model
+    result["requested_provider"] = (provider or "").strip() or None
+    result["effective_provider"] = runtime.get("provider")
+    if static_skill:
+        result["skill_path"] = static_skill.path
+        result["skill_sha256"] = static_skill.sha256
+        result["skill_identity"] = list(static_skill.skill_identity)
+    result["isolation_flags"] = [
+        flag
+        for flag, enabled in (
+            ("no-tools", no_tools),
+            ("no-fallback", no_fallback),
+            ("no-dotenv", no_dotenv),
+            ("safe-mode", safe_mode),
+        )
+        if enabled
+    ] + (["skill-path"] if static_skill else [])
     return (result.get("final_response") or "", result)
 
 

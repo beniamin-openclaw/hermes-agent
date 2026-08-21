@@ -62,3 +62,45 @@ def nous_portal_tags() -> List[str]:
     (e.g. ``merged_extra.setdefault("tags", []).extend(nous_portal_tags())``).
     """
     return ["product=hermes-agent", hermes_client_tag()]
+
+
+def nous_request_policy(
+    *,
+    model: str | None,
+    reasoning_config: dict | None = None,
+    supports_reasoning: bool = True,
+) -> dict:
+    """Return discovery-free request policy shared by Nous request paths.
+
+    The ordinary provider profile is discovered lazily, which is deliberately
+    forbidden for the isolated review one-shot. Keep the small set of Nous
+    wire rules here so the isolated path can use the same tags, reasoning
+    omission/defaults, and Anthropic-compatible output cap.
+    """
+    reasoning = None
+    if supports_reasoning:
+        if reasoning_config is None:
+            reasoning = {"enabled": True, "effort": "medium"}
+        else:
+            candidate = dict(reasoning_config)
+            if candidate.get("enabled") is not False:
+                reasoning = candidate
+
+    max_tokens = None
+    try:
+        from agent.anthropic_adapter import (
+            _ANTHROPIC_OUTPUT_LIMITS,
+            _get_anthropic_max_output,
+        )
+
+        model_norm = (model or "").lower().replace(".", "-")
+        if any(key in model_norm for key in _ANTHROPIC_OUTPUT_LIMITS):
+            max_tokens = _get_anthropic_max_output(model or "")
+    except Exception:
+        max_tokens = None
+
+    return {
+        "tags": nous_portal_tags(),
+        "reasoning": reasoning,
+        "max_tokens": max_tokens,
+    }

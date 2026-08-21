@@ -65,6 +65,52 @@ import os
 import sys
 
 
+def _isolated_oneshot_no_dotenv_requested(argv: list[str] | None = None) -> bool:
+    """Return whether argv requests the isolated one-shot dotenv gate."""
+    values = sys.argv[1:] if argv is None else argv
+    has_oneshot = any(
+        value in {"-z", "--oneshot"} or value.startswith("--oneshot=")
+        for value in values
+    )
+    return has_oneshot and any(
+        value == "--no-dotenv" or value.startswith("--no-dotenv=")
+        for value in values
+    )
+
+
+def _load_project_dotenv_with_early_gate(
+    *,
+    project_env=None,
+    argv: list[str] | None = None,
+    load_fn=None,
+):
+    """Load dotenv while scoping the pre-parse isolated-mode override.
+
+    ``hermes_cli.env_loader`` reads ``HERMES_NO_DOTENV`` at import/call time,
+    so the override must exist before that import. It is nevertheless a
+    bootstrap detail, not process state: restore the caller's exact value as
+    soon as the loader returns (or raises).
+    """
+    key = "HERMES_NO_DOTENV"
+    had_value = key in os.environ
+    previous_value = os.environ.get(key)
+    if _isolated_oneshot_no_dotenv_requested(argv):
+        os.environ[key] = "1"
+    try:
+        if load_fn is None:
+            from hermes_cli.env_loader import load_hermes_dotenv as load_fn
+
+        kwargs = {}
+        if project_env is not None:
+            kwargs["project_env"] = project_env
+        return load_fn(**kwargs)
+    finally:
+        if had_value:
+            os.environ[key] = previous_value
+        else:
+            os.environ.pop(key, None)
+
+
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
     'htop' show the app name instead of 'python3.xx'.
@@ -400,6 +446,7 @@ def _apply_profile_override() -> None:
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--skill-path",
     }
     optional_value_flags = {"-c", "--continue"}
     i = 0
@@ -515,9 +562,8 @@ _apply_profile_override()
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
-from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+_load_project_dotenv_with_early_gate(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -12256,6 +12302,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--skill-path",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as
         # value-taking: if the next token is a subcommand-looking word
         # the user almost certainly meant it as the session name, and
@@ -12327,6 +12374,27 @@ _AGENT_SUBCOMMANDS = {
     "gateway": ("gateway_command", {"run"}),
     "mcp": ("mcp_action", {"serve"}),
 }
+
+
+def _oneshot_uses_isolated_flags(args) -> bool:
+    """Return whether one-shot startup must avoid external discovery."""
+    if not getattr(args, "oneshot", None):
+        return False
+    requested_skills = getattr(args, "skills", None) or []
+    if isinstance(requested_skills, str):
+        requested_skills = [requested_skills]
+    return bool(
+        getattr(args, "no_tools", False)
+        or getattr(args, "skill_path", None)
+        or getattr(args, "no_fallback", False)
+        or getattr(args, "no_dotenv", False)
+        or getattr(args, "safe_mode", False)
+        or any(
+            isinstance(item, str)
+            and "review-system" in {part.strip() for part in item.split(",")}
+            for item in requested_skills
+        )
+    )
 
 
 def _is_tui_chat_launch(args) -> bool:
@@ -12470,7 +12538,8 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     if getattr(args, "oneshot", None):
-        _prepare_agent_startup(args)
+        if not _oneshot_uses_isolated_flags(args):
+            _prepare_agent_startup(args)
         from hermes_cli.oneshot import run_oneshot
 
         sys.exit(
@@ -12480,6 +12549,12 @@ def _try_termux_fast_cli_launch() -> bool:
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
                 usage_file=getattr(args, "usage_file", None),
+                skills=getattr(args, "skills", None),
+                skill_path=getattr(args, "skill_path", None),
+                no_tools=getattr(args, "no_tools", False),
+                no_fallback=getattr(args, "no_fallback", False),
+                no_dotenv=getattr(args, "no_dotenv", False),
+                safe_mode=getattr(args, "safe_mode", False),
             )
         )
 
@@ -14116,7 +14191,10 @@ def main():
     # so introspection/management commands (hermes hooks list, cron
     # list, gateway status, mcp add, ...) don't pay discovery cost or
     # trigger consent prompts for hooks the user is still inspecting.
-    _prepare_agent_startup(args)
+    if not (
+        getattr(args, "oneshot", None) and _oneshot_uses_isolated_flags(args)
+    ):
+        _prepare_agent_startup(args)
 
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
@@ -14130,6 +14208,12 @@ def main():
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
                 usage_file=getattr(args, "usage_file", None),
+                skills=getattr(args, "skills", None),
+                skill_path=getattr(args, "skill_path", None),
+                no_tools=getattr(args, "no_tools", False),
+                no_fallback=getattr(args, "no_fallback", False),
+                no_dotenv=getattr(args, "no_dotenv", False),
+                safe_mode=getattr(args, "safe_mode", False),
             )
         )
 

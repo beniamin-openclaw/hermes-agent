@@ -132,16 +132,47 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
-# Import our tool system
-from model_tools import (
-    get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
-    get_toolset_for_tool,
-    handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
-    check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
-)
-from tools.terminal_tool import cleanup_vm
-from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+def get_tool_definitions(*args, **kwargs):
+    """Lazy bridge preserving the patchable run_agent test seam."""
+    from model_tools import get_tool_definitions as _get_tool_definitions
+
+    return _get_tool_definitions(*args, **kwargs)
+
+
+def get_toolset_for_tool(*args, **kwargs):
+    from model_tools import get_toolset_for_tool as _get_toolset_for_tool
+
+    return _get_toolset_for_tool(*args, **kwargs)
+
+
+def handle_function_call(*args, **kwargs):
+    from model_tools import handle_function_call as _handle_function_call
+
+    return _handle_function_call(*args, **kwargs)
+
+
+def check_toolset_requirements(*args, **kwargs):
+    from model_tools import check_toolset_requirements as _check_toolset_requirements
+
+    return _check_toolset_requirements(*args, **kwargs)
+
+
+def cleanup_vm(*args, **kwargs):
+    from tools.terminal_tool import cleanup_vm as _cleanup_vm
+
+    return _cleanup_vm(*args, **kwargs)
+
+
+def _set_interrupt(*args, **kwargs):
+    from tools.interrupt import set_interrupt
+
+    return set_interrupt(*args, **kwargs)
+
+
+def cleanup_browser(*args, **kwargs):
+    from tools.browser_tool import cleanup_browser as _cleanup_browser
+
+    return _cleanup_browser(*args, **kwargs)
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -480,6 +511,7 @@ class AIAgent:
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
+        isolated_oneshot: bool = False,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
@@ -555,6 +587,7 @@ class AIAgent:
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
+            isolated_oneshot=isolated_oneshot,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
@@ -4073,6 +4106,20 @@ class AIAgent:
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
+
+        if getattr(self, "isolated_oneshot", False):
+            # Isolated turns have no shared primary client to seed. Copy the
+            # immutable request configuration once and build exactly one
+            # request-local client; the interruptible call owns its close.
+            with self._openai_client_lock():
+                request_kwargs = dict(self._client_kwargs)
+            request_kwargs["max_retries"] = 0
+            if (
+                base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
+                and self._api_kwargs_have_image_parts(api_kwargs or {})
+            ):
+                request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
+            return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":

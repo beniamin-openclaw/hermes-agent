@@ -198,6 +198,27 @@ class TestOpenRouterParity:
 class TestNousParity:
     """Nous: product tags, reasoning, omit when disabled."""
 
+    def test_hermes_model_has_no_anthropic_default_cap(self, transport):
+        kw = transport.build_kwargs(
+            model="hermes-3-llama-3.1-405b",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("nous"),
+            max_tokens_param_fn=_max_tokens_fn,
+        )
+        assert "max_completion_tokens" not in kw
+
+    def test_explicit_max_tokens_wins_over_provider_policy(self, transport):
+        kw = transport.build_kwargs(
+            model="anthropic/claude-sonnet-4.6",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("nous"),
+            max_tokens=4096,
+            max_tokens_param_fn=_max_tokens_fn,
+        )
+        assert kw["max_completion_tokens"] == 4096
+
     def test_tags(self, transport):
         from agent.portal_tags import nous_portal_tags
         kw = transport.build_kwargs(
