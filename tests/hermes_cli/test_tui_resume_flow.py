@@ -380,6 +380,12 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "provider": "openai",
         "toolsets": None,
         "usage_file": None,
+        "skills": None,
+        "skill_path": None,
+        "no_tools": False,
+        "no_fallback": False,
+        "no_dotenv": False,
+        "safe_mode": False,
     }
 
 
@@ -619,6 +625,12 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "provider": None,
         "toolsets": "web,terminal",
         "usage_file": None,
+        "skills": None,
+        "skill_path": None,
+        "no_tools": False,
+        "no_fallback": False,
+        "no_dotenv": False,
+        "safe_mode": False,
     }
 
 

@@ -123,6 +123,30 @@ def build_top_level_parser():
             "can always account for spend. No effect outside -z/--oneshot."
         ),
     )
+    parser.add_argument(
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help="One-shot mode only: construct the agent with an explicit empty toolset.",
+    )
+    parser.add_argument(
+        "--skill-path",
+        metavar="PATH",
+        default=None,
+        help="Isolated one-shot mode only: load exactly PATH/SKILL.md from an immutable absolute release path.",
+    )
+    parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        default=False,
+        help="One-shot mode only: disable the configured fallback chain.",
+    )
+    parser.add_argument(
+        "--no-dotenv",
+        action="store_true",
+        default=False,
+        help="One-shot mode only: skip dotenv and external secret-source initialization.",
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.
