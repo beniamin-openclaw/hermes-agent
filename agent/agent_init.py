@@ -379,6 +379,94 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    if os.environ.get("HERMES_ISOLATED_ONESHOT") == "1":
+        _install_safe_stdio()
+        agent.model = model
+        agent.max_iterations = max_iterations
+        agent.tool_delay = tool_delay
+        agent.save_trajectories = False
+        agent.verbose_logging = False
+        agent.quiet_mode = True
+        agent.tool_progress_mode = tool_progress_mode
+        agent.ephemeral_system_prompt = ephemeral_system_prompt
+        agent.platform = platform or "cli"
+        agent.provider = (provider or "").strip().lower()
+        agent.api_mode = api_mode or "chat_completions"
+        agent.api_key = api_key or ""
+        agent.base_url = base_url or ""
+        agent.enabled_toolsets = []
+        agent.disabled_toolsets = []
+        agent.tools = []
+        agent.valid_tool_names = set()
+        agent._tool_snapshot_generation = 0
+        agent._session_db = None
+        agent._session_db_created = False
+        agent._persist_disabled = True
+        agent.session_id = session_id or "isolated-oneshot"
+        agent.session_start = datetime.now()
+        agent._session_messages = []
+        agent._cached_system_prompt = None
+        agent.context_compressor = None
+        agent._memory_store = None
+        agent._memory_manager = None
+        agent._memory_enabled = False
+        agent._user_profile_enabled = False
+        agent._session_json_enabled = False
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+        agent._fallback_model = None
+        agent._credential_pool = credential_pool
+        agent._client_kwargs = {
+            "api_key": agent.api_key,
+            "base_url": agent.base_url,
+        }
+        agent.client = None
+        agent._anthropic_client = None
+        agent._is_anthropic_oauth = False
+        agent._transport_cache = {}
+        agent._checkpoint_mgr = None
+        agent._todo_store = None
+        agent._context_engine_tool_names = set()
+        agent._environment_probe = False
+        agent._skip_mcp_refresh = True
+        agent._tool_guardrails = None
+        agent._tool_guardrail_halt_decision = None
+        agent._interrupt_requested = False
+        agent._pending_steer = None
+        agent._active_children = []
+        agent._delegate_depth = 0
+        agent._stream_callback = None
+        agent._stream_needs_break = False
+        agent._use_prompt_caching = False
+        agent._use_native_cache_layout = False
+        agent._cache_ttl = "5m"
+        agent._api_call_count = 0
+        agent._api_max_retries = 1
+        agent._rate_limit_state = None
+        agent._compression_warning = None
+        agent.compression_enabled = False
+        agent.compression_in_place = False
+        agent._compression_feasibility_checked = True
+        agent._primary_runtime = {}
+        agent.tool_progress_callback = tool_progress_callback
+        agent.tool_start_callback = tool_start_callback
+        agent.tool_complete_callback = tool_complete_callback
+        agent.thinking_callback = thinking_callback
+        agent.reasoning_callback = reasoning_callback
+        agent.clarify_callback = clarify_callback
+        agent.read_terminal_callback = read_terminal_callback
+        agent.step_callback = step_callback
+        agent.stream_delta_callback = stream_delta_callback
+        agent.interim_assistant_callback = interim_assistant_callback
+        agent.status_callback = status_callback
+        agent.notice_callback = notice_callback
+        agent.notice_clear_callback = notice_clear_callback
+        agent.event_callback = event_callback
+        agent.tool_gen_callback = tool_gen_callback
+        agent.suppress_status_output = True
+        return
+
     _install_safe_stdio()
 
     agent.model = model

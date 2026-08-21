@@ -132,16 +132,40 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
-# Import our tool system
-from model_tools import (
-    get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
-    get_toolset_for_tool,
-    handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
-    check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
-)
-from tools.terminal_tool import cleanup_vm
-from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+_ISOLATED_ONESHOT = os.environ.get("HERMES_ISOLATED_ONESHOT") == "1"
+
+if _ISOLATED_ONESHOT:
+    def get_tool_definitions(*_args, **_kwargs):
+        return []
+
+    def get_toolset_for_tool(*_args, **_kwargs):
+        return None
+
+    def handle_function_call(*_args, **_kwargs):
+        raise RuntimeError("tool calls are unavailable in isolated one-shot mode")
+
+    def check_toolset_requirements(*_args, **_kwargs):
+        return {}
+
+    def cleanup_vm(*_args, **_kwargs):
+        return None
+
+    def _set_interrupt(*_args, **_kwargs):
+        return None
+
+    def cleanup_browser(*_args, **_kwargs):
+        return None
+else:
+    # Import our tool system
+    from model_tools import (
+        get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
+        get_toolset_for_tool,
+        handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
+        check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
+    )
+    from tools.terminal_tool import cleanup_vm
+    from tools.interrupt import set_interrupt as _set_interrupt
+    from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity

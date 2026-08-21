@@ -185,7 +185,8 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+if os.environ.get("HERMES_ISOLATED_ONESHOT") != "1":
+    discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()
@@ -201,11 +202,12 @@ discover_builtin_tools()
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
 # Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+if os.environ.get("HERMES_ISOLATED_ONESHOT") != "1":
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================

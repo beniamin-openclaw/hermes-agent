@@ -43,6 +43,15 @@ class _StaticSkill:
     sha256: str
     text: str
     system_message: str
+    skill_identity: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _VerifiedSkillRead:
+    raw: bytes
+    release_path: Path
+    release_identity: tuple[int, int]
+    skill_identity: tuple[int, int, int, int, int]
 
 
 def _skill_error(message: str) -> ValueError:
@@ -53,7 +62,17 @@ def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
-def _read_static_skill_bytes(release_path: Path) -> bytes:
+def _skill_snapshot(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_static_skill_bytes(release_path: Path) -> _VerifiedSkillRead:
     """Read ``release_path/SKILL.md`` without following path components."""
     if not release_path.is_absolute():
         raise _skill_error("release path must be absolute")
@@ -114,7 +133,15 @@ def _read_static_skill_bytes(release_path: Path) -> bytes:
                 or closed_stat.st_size != len(raw)
             ):
                 raise _skill_error("SKILL.md changed during read")
-            return raw
+            return _VerifiedSkillRead(
+                raw=raw,
+                release_path=release_path,
+                release_identity=(
+                    os.fstat(directory_fd).st_dev,
+                    os.fstat(directory_fd).st_ino,
+                ),
+                skill_identity=_skill_snapshot(opened),
+            )
         finally:
             os.close(skill_fd)
     except FileNotFoundError as exc:
@@ -173,14 +200,24 @@ def _frontmatter_value(raw_text: str) -> str:
 def _load_static_skill(release_path: Path | str) -> _StaticSkill:
     """Load the approved skill as bounded inert text from an immutable path."""
     release = Path(release_path)
-    raw = _read_static_skill_bytes(release)
+    verified = _read_static_skill_bytes(release)
+    try:
+        release_stat = os.stat(verified.release_path, follow_symlinks=False)
+        skill_stat = os.stat(verified.release_path / "SKILL.md", follow_symlinks=False)
+    except OSError as exc:
+        raise _skill_error("release path changed before receipt binding") from exc
+    if (
+        (release_stat.st_dev, release_stat.st_ino) != verified.release_identity
+        or _skill_snapshot(skill_stat) != verified.skill_identity
+    ):
+        raise _skill_error("release path or SKILL.md changed before receipt binding")
+    raw = verified.raw
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise _skill_error("SKILL.md is not valid UTF-8") from exc
     _frontmatter_value(text)
-    resolved_release = release.resolve(strict=True)
-    resolved_skill = resolved_release / "SKILL.md"
+    resolved_skill = verified.release_path / "SKILL.md"
     digest = hashlib.sha256(raw).hexdigest()
     system_message = (
         "[R2H isolated static skill]\n"
@@ -195,6 +232,7 @@ def _load_static_skill(release_path: Path | str) -> _StaticSkill:
         sha256=digest,
         text=text,
         system_message=system_message,
+        skill_identity=verified.skill_identity,
     )
 
 
@@ -365,6 +403,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "effective_provider": result.get("effective_provider"),
             "skill_path": result.get("skill_path"),
             "skill_sha256": result.get("skill_sha256"),
+            "skill_identity": result.get("skill_identity"),
             "isolation_flags": result.get("isolation_flags"),
             "session_id": result.get("session_id"),
             "completed": result.get("completed"),
@@ -596,6 +635,8 @@ def _run_agent(
         safe_mode=safe_mode,
     )
     isolated = static_skill is not None
+    if isolated:
+        os.environ["HERMES_ISOLATED_ONESHOT"] = "1"
 
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
@@ -740,6 +781,7 @@ def _run_agent(
     if static_skill:
         result["skill_path"] = static_skill.path
         result["skill_sha256"] = static_skill.sha256
+        result["skill_identity"] = list(static_skill.skill_identity)
     result["isolation_flags"] = [
         flag
         for flag, enabled in (

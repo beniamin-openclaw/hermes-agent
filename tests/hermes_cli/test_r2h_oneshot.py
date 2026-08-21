@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import types
 
@@ -182,6 +183,144 @@ def test_real_oneshot_uses_injected_inference_seam_and_isolated_home(
     assert report["skill_path"] == str(skill.resolve())
 
 
+def test_isolated_import_gate_is_set_before_agent_module_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill = _write_skill(tmp_path / "release")
+    captured: dict[str, object] = {}
+
+    class GateAgent:
+        def __init__(self, **kwargs: object) -> None:
+            assert os.environ.get("HERMES_ISOLATED_ONESHOT") == "1"
+            captured["agent_kwargs"] = kwargs
+
+        def run_conversation(self, prompt: str, **kwargs: object) -> dict[str, object]:
+            return {"final_response": "ok"}
+
+    _install_fake_agent_stack(monkeypatch, captured)
+    monkeypatch.setitem(sys.modules, "run_agent", _module("run_agent", AIAgent=GateAgent))
+
+    from hermes_cli.oneshot import _run_agent
+
+    _run_agent("prompt", **_isolated_kwargs(skill))
+    assert captured["agent_kwargs"]["enabled_toolsets"] == []
+
+
+def test_isolated_model_tools_import_skips_builtin_and_plugin_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.registry as registry
+
+    builtin_calls: list[bool] = []
+    plugin_calls: list[bool] = []
+    monkeypatch.setattr(registry, "discover_builtin_tools", lambda: builtin_calls.append(True))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        _module("hermes_cli.plugins", discover_plugins=lambda: plugin_calls.append(True)),
+    )
+    monkeypatch.setenv("HERMES_ISOLATED_ONESHOT", "1")
+    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
+
+    import model_tools  # noqa: F401
+
+    assert builtin_calls == []
+    assert plugin_calls == []
+
+
+@pytest.mark.parametrize("module_name", ["hermes_cli.main", "run_agent"])
+def test_no_dotenv_real_import_subprocess_skips_env_files(
+    tmp_path: Path, module_name: str
+) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text(
+        "R2H_NO_DOTENV_PROBE=loaded-from-env-file\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_NO_DOTENV": "1",
+            "R2H_NO_DOTENV_PROBE": "shell-value",
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import os; import {module_name}; print(os.environ['R2H_NO_DOTENV_PROBE'])",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=Path.cwd(),
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "shell-value"
+
+
+def test_real_isolated_agent_skips_context_construction_and_reaches_fake_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill = _write_skill(tmp_path / "release")
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        _module("hermes_cli.models", detect_provider_for_model=lambda *_a, **_k: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        _module(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {
+                "api_key": "fixture-key",
+                "base_url": "https://fixture.invalid/v1",
+                "provider": "nous",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        _module("hermes_cli.tools_config", _get_platform_tools=lambda *_a, **_k: []),
+    )
+    monkeypatch.setenv("HERMES_ISOLATED_ONESHOT", "1")
+    monkeypatch.setenv("HERMES_NO_DOTENV", "1")
+    monkeypatch.delitem(sys.modules, "run_agent", raising=False)
+
+    from agent import agent_init
+    from hermes_cli import oneshot
+
+    def forbidden_context(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("isolated construction must not create a context engine")
+
+    monkeypatch.setattr(agent_init, "ContextCompressor", forbidden_context)
+    captured: dict[str, object] = {}
+
+    def fake_inference(agent: object, prompt: str, system_message: str) -> dict[str, object]:
+        captured["agent"] = agent
+        captured["prompt"] = prompt
+        captured["system_message"] = system_message
+        return {"final_response": "fake provider response"}
+
+    text, _result = oneshot._run_agent(
+        "prompt",
+        **_isolated_kwargs(skill),
+        inference_runner=fake_inference,
+    )
+
+    assert text == "fake provider response"
+    assert captured["prompt"] == "prompt"
+    assert captured["agent"].tools == []
+    assert captured["agent"].context_compressor is None
+
+
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
@@ -274,6 +413,57 @@ def test_static_skill_rejects_file_identity_change_during_read(
     monkeypatch.setattr(oneshot.os, "read", mutate_after_read)
     with pytest.raises(ValueError, match="changed|identity"):
         oneshot._load_static_skill(skill.parent)
+
+
+def test_static_skill_receipt_does_not_resolve_after_descriptor_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_cli import oneshot
+
+    skill = _write_skill(tmp_path / "release")
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("receipt must not resolve after descriptor close")
+        ),
+    )
+
+    result = oneshot._load_static_skill(skill.parent)
+
+    assert result.path == str(skill)
+
+
+def test_static_skill_rejects_ancestor_swap_during_descriptor_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_cli import oneshot
+
+    skill = _write_skill(tmp_path / "release", body="original\n")
+    release = skill.parent
+    original_close = oneshot.os.close
+    swapped = False
+
+    def swap_after_release_close(fd: int) -> None:
+        nonlocal swapped
+        try:
+            fd_stat = oneshot.os.fstat(fd)
+            release_stat = release.stat()
+        except OSError:
+            fd_stat = None
+            release_stat = None
+        original_close(fd)
+        if not swapped and fd_stat and release_stat and fd_stat.st_ino == release_stat.st_ino:
+            replacement = _write_skill(tmp_path / "replacement", body="swapped\n")
+            old_release = tmp_path / "old-release"
+            release.rename(old_release)
+            replacement.parent.rename(release)
+            swapped = True
+
+    monkeypatch.setattr(oneshot.os, "close", swap_after_release_close)
+
+    with pytest.raises(ValueError, match="changed|identity|path"):
+        oneshot._load_static_skill(release)
 
 
 def test_usage_receipt_contains_isolation_and_requested_effective_identity(tmp_path: Path) -> None:
