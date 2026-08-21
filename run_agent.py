@@ -132,40 +132,47 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
-_ISOLATED_ONESHOT = os.environ.get("HERMES_ISOLATED_ONESHOT") == "1"
+def get_tool_definitions(*args, **kwargs):
+    """Lazy bridge preserving the patchable run_agent test seam."""
+    from model_tools import get_tool_definitions as _get_tool_definitions
 
-if _ISOLATED_ONESHOT:
-    def get_tool_definitions(*_args, **_kwargs):
-        return []
+    return _get_tool_definitions(*args, **kwargs)
 
-    def get_toolset_for_tool(*_args, **_kwargs):
-        return None
 
-    def handle_function_call(*_args, **_kwargs):
-        raise RuntimeError("tool calls are unavailable in isolated one-shot mode")
+def get_toolset_for_tool(*args, **kwargs):
+    from model_tools import get_toolset_for_tool as _get_toolset_for_tool
 
-    def check_toolset_requirements(*_args, **_kwargs):
-        return {}
+    return _get_toolset_for_tool(*args, **kwargs)
 
-    def cleanup_vm(*_args, **_kwargs):
-        return None
 
-    def _set_interrupt(*_args, **_kwargs):
-        return None
+def handle_function_call(*args, **kwargs):
+    from model_tools import handle_function_call as _handle_function_call
 
-    def cleanup_browser(*_args, **_kwargs):
-        return None
-else:
-    # Import our tool system
-    from model_tools import (
-        get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
-        get_toolset_for_tool,
-        handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
-        check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
-    )
-    from tools.terminal_tool import cleanup_vm
-    from tools.interrupt import set_interrupt as _set_interrupt
-    from tools.browser_tool import cleanup_browser
+    return _handle_function_call(*args, **kwargs)
+
+
+def check_toolset_requirements(*args, **kwargs):
+    from model_tools import check_toolset_requirements as _check_toolset_requirements
+
+    return _check_toolset_requirements(*args, **kwargs)
+
+
+def cleanup_vm(*args, **kwargs):
+    from tools.terminal_tool import cleanup_vm as _cleanup_vm
+
+    return _cleanup_vm(*args, **kwargs)
+
+
+def _set_interrupt(*args, **kwargs):
+    from tools.interrupt import set_interrupt
+
+    return set_interrupt(*args, **kwargs)
+
+
+def cleanup_browser(*args, **kwargs):
+    from tools.browser_tool import cleanup_browser as _cleanup_browser
+
+    return _cleanup_browser(*args, **kwargs)
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -504,6 +511,7 @@ class AIAgent:
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
+        isolated_oneshot: bool = False,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
@@ -579,6 +587,7 @@ class AIAgent:
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
+            isolated_oneshot=isolated_oneshot,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,

@@ -507,6 +507,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
+
     if api_messages and api_messages[0].get("role") == "system":
         effective = sp
         if agent.ephemeral_system_prompt:
@@ -515,6 +516,145 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _run_isolated_single_turn(
+    agent,
+    user_message: str,
+    system_message: str | None,
+) -> Dict[str, Any]:
+    """Run exactly one toolless request through the normal provider seam.
+
+    Isolated review one-shots deliberately bypass the ordinary turn prologue
+    and loop. The request is still built by ``AIAgent._build_api_kwargs`` and
+    sent by ``AIAgent._interruptible_api_call`` so provider-specific request
+    construction, client creation, and response normalization remain shared
+    with Hermes rather than being reimplemented here.
+    """
+    messages: List[Dict[str, Any]] = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": user_message})
+
+    transport = agent._get_transport()
+    if agent.api_mode == "chat_completions":
+        # Do not call AIAgent._build_api_kwargs here: that ordinary helper
+        # intentionally lazy-discovers bundled and user provider plugins.
+        # The isolated contract uses the same resolved transport's generic
+        # provider-faithful builder with discovery-free route flags.
+        base_url_lower = (agent.base_url or "").lower()
+        api_kwargs = transport.build_kwargs(
+            model=agent.model,
+            messages=messages,
+            tools=[],
+            base_url=agent.base_url,
+            timeout=agent._resolved_api_call_timeout(),
+            max_tokens=agent.max_tokens,
+            ephemeral_max_output_tokens=None,
+            max_tokens_param_fn=agent._max_tokens_param,
+            reasoning_config=agent.reasoning_config,
+            request_overrides=agent.request_overrides,
+            session_id=agent.session_id,
+            model_lower=(agent.model or "").lower(),
+            is_openrouter="openrouter.ai" in base_url_lower,
+            is_nous=(agent.provider == "nous" or "nousresearch" in base_url_lower),
+            is_qwen_portal=False,
+            is_github_models=False,
+            is_nvidia_nim=False,
+            is_kimi=False,
+            is_tokenhub=False,
+            is_lmstudio=False,
+            is_custom_provider=agent.provider == "custom",
+            ollama_num_ctx=None,
+            provider_preferences=None,
+            openrouter_min_coding_score=None,
+            qwen_prepare_fn=None,
+            qwen_prepare_inplace_fn=None,
+            qwen_session_metadata=None,
+            fixed_temperature=None,
+            omit_temperature=False,
+            supports_reasoning=False,
+            github_reasoning_extra=None,
+            lmstudio_reasoning_options=None,
+            anthropic_max_output=None,
+            provider_name=agent.provider,
+        )
+    else:
+        # Non-chat transports own their protocol-specific request shape; they
+        # are still resolved through Hermes' transport registry and never via
+        # an isolated duplicate client or loop.
+        api_kwargs = transport.build_kwargs(
+            model=agent.model,
+            messages=messages,
+            tools=[],
+            reasoning_config=agent.reasoning_config,
+            session_id=agent.session_id,
+            max_tokens=agent.max_tokens,
+            timeout=agent._resolved_api_call_timeout(),
+            request_overrides=agent.request_overrides,
+        )
+    response = agent._interruptible_api_call(api_kwargs)
+    if response is None:
+        raise RuntimeError("isolated one-shot provider returned no response")
+
+    normalized = transport.normalize_response(response)
+    if normalized.tool_calls:
+        raise RuntimeError("isolated one-shot provider returned tool calls")
+
+    content = normalized.content or ""
+    if not isinstance(content, str):
+        content = str(content)
+    content = agent._strip_think_blocks(content).strip()
+    assistant_message = {"role": "assistant", "content": content}
+    messages.append(assistant_message)
+
+    usage = normalize_usage(
+        normalized.usage,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+    agent._api_call_count = 1
+    agent.session_api_calls = 1
+    agent.session_input_tokens = usage.input_tokens
+    agent.session_output_tokens = usage.output_tokens
+    agent.session_cache_read_tokens = usage.cache_read_tokens
+    agent.session_cache_write_tokens = usage.cache_write_tokens
+    agent.session_reasoning_tokens = usage.reasoning_tokens
+    agent.session_prompt_tokens = (
+        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+    )
+    agent.session_completion_tokens = usage.output_tokens
+    agent.session_total_tokens = agent.session_prompt_tokens + usage.output_tokens
+    agent._session_messages = messages
+    agent._touch_activity("isolated one-shot completed")
+
+    return {
+        "final_response": content,
+        "last_reasoning": normalized.reasoning,
+        "messages": messages,
+        "api_calls": 1,
+        "completed": True,
+        "turn_exit_reason": "isolated_single_turn",
+        "failed": False,
+        "partial": False,
+        "interrupted": False,
+        "response_transformed": False,
+        "response_previewed": False,
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "input_tokens": agent.session_input_tokens,
+        "output_tokens": agent.session_output_tokens,
+        "cache_read_tokens": agent.session_cache_read_tokens,
+        "cache_write_tokens": agent.session_cache_write_tokens,
+        "reasoning_tokens": agent.session_reasoning_tokens,
+        "prompt_tokens": agent.session_prompt_tokens,
+        "completion_tokens": agent.session_completion_tokens,
+        "total_tokens": agent.session_total_tokens,
+        "last_prompt_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "cost_status": "unknown",
+        "cost_source": "none",
+        "session_id": agent.session_id,
+    }
 def run_conversation(
     agent,
     user_message: str,
@@ -547,6 +687,9 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if getattr(agent, "isolated_oneshot", False):
+        return _run_isolated_single_turn(agent, user_message, system_message)
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn

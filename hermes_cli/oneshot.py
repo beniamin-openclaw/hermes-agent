@@ -28,6 +28,7 @@ import stat
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -35,6 +36,33 @@ from hermes_cli.fallback_config import get_fallback_chain
 
 
 MAX_STATIC_SKILL_BYTES = 1024 * 1024
+
+_ONESHOT_ENV_KEYS = (
+    "HERMES_NO_DOTENV",
+    "HERMES_SAFE_MODE",
+    "HERMES_IGNORE_USER_CONFIG",
+    "HERMES_IGNORE_RULES",
+    "HERMES_YOLO_MODE",
+    "HERMES_ACCEPT_HOOKS",
+    "HERMES_ISOLATED_ONESHOT",
+)
+
+
+def _preserve_oneshot_environment(function):
+    """Restore one-shot posture variables even when the turn raises."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        snapshot = {key: os.environ.get(key) for key in _ONESHOT_ENV_KEYS}
+        try:
+            return function(*args, **kwargs)
+        finally:
+            for key, value in snapshot.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -418,6 +446,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+@_preserve_oneshot_environment
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -600,6 +629,7 @@ def _create_session_db_for_oneshot():
         return None
 
 
+@_preserve_oneshot_environment
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -635,8 +665,6 @@ def _run_agent(
         safe_mode=safe_mode,
     )
     isolated = static_skill is not None
-    if isolated:
-        os.environ["HERMES_ISOLATED_ONESHOT"] = "1"
 
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
@@ -739,6 +767,7 @@ def _run_agent(
         fallback_model=_fb if (no_fallback or isolated or safe_mode) else (_fb or None),
         skip_context_files=isolated or safe_mode,
         skip_memory=isolated or safe_mode,
+        isolated_oneshot=isolated,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction

@@ -183,49 +183,195 @@ def test_real_oneshot_uses_injected_inference_seam_and_isolated_home(
     assert report["skill_path"] == str(skill.resolve())
 
 
-def test_isolated_import_gate_is_set_before_agent_module_construction(
+def _fake_chat_response(text: str = "isolated response") -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        model="pinned-model",
+        choices=[
+            types.SimpleNamespace(
+                message=types.SimpleNamespace(
+                    content=text,
+                    tool_calls=None,
+                    reasoning=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=types.SimpleNamespace(
+            prompt_tokens=7,
+            completion_tokens=3,
+            total_tokens=10,
+        ),
+    )
+
+
+def _install_fake_provider(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    import run_agent
+
+    requests: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> types.SimpleNamespace:
+            requests.append(kwargs)
+            return _fake_chat_response()
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(run_agent, "OpenAI", FakeOpenAI)
+    return requests
+
+
+@pytest.mark.parametrize("oneshot_imports_first", [False, True])
+def test_real_isolated_run_conversation_uses_one_fake_transport_request(
+    monkeypatch: pytest.MonkeyPatch, oneshot_imports_first: bool
+) -> None:
+    """The real AIAgent path must isolate without the process-global env gate."""
+    import importlib
+
+    monkeypatch.delenv("HERMES_ISOLATED_ONESHOT", raising=False)
+    monkeypatch.delenv("HERMES_NO_DOTENV", raising=False)
+    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
+    monkeypatch.delitem(sys.modules, "run_agent", raising=False)
+    monkeypatch.delitem(sys.modules, "hermes_cli.oneshot", raising=False)
+
+    if oneshot_imports_first:
+        importlib.import_module("hermes_cli.oneshot")
+        run_agent = importlib.import_module("run_agent")
+    else:
+        run_agent = importlib.import_module("run_agent")
+        importlib.import_module("hermes_cli.oneshot")
+
+    requests = _install_fake_provider(monkeypatch)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("isolated run reached a forbidden subsystem")
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", forbidden)
+    monkeypatch.setattr(run_agent, "get_toolset_for_tool", forbidden)
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", forbidden)
+
+    from agent import agent_init, conversation_loop
+    import providers
+
+    monkeypatch.setattr(agent_init, "ContextCompressor", forbidden)
+    monkeypatch.setattr(agent_init, "StreamingContextScrubber", forbidden)
+    monkeypatch.setattr(conversation_loop, "build_turn_context", forbidden)
+    monkeypatch.setattr(conversation_loop, "_restore_or_build_system_prompt", forbidden)
+    monkeypatch.setattr(providers, "_discover_providers", forbidden)
+
+    agent = run_agent.AIAgent(
+        api_key="fixture-key",
+        base_url="https://fixture.invalid/v1",
+        provider="nous",
+        api_mode="chat_completions",
+        model="pinned-model",
+        enabled_toolsets=[],
+        fallback_model=[],
+        session_db=None,
+        skip_context_files=True,
+        skip_memory=True,
+        quiet_mode=True,
+        isolated_oneshot=True,
+    )
+
+    result = agent.run_conversation("review prompt", system_message="static skill")
+
+    assert result["final_response"] == "isolated response"
+    assert result["completed"] is True
+    assert result["api_calls"] == 1
+    assert len(requests) == 1
+    assert "tools" not in requests[0] or requests[0]["tools"] in (None, [])
+    assert agent.tools == []
+    assert agent._session_db is None
+    assert agent.context_compressor is None
+    assert os.environ.get("HERMES_ISOLATED_ONESHOT") is None
+
+
+def test_isolation_is_per_call_and_environment_is_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill = _write_skill(tmp_path / "release")
+    captured: list[dict[str, object]] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = None
+            self.tool_gen_callback = None
+
+        def run_conversation(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"final_response": "ok", "api_calls": 1}
+
+    _install_fake_agent_stack(monkeypatch, {})
+    monkeypatch.setitem(sys.modules, "run_agent", _module("run_agent", AIAgent=FakeAgent))
+    keys = (
+        "HERMES_NO_DOTENV",
+        "HERMES_SAFE_MODE",
+        "HERMES_IGNORE_USER_CONFIG",
+        "HERMES_IGNORE_RULES",
+        "HERMES_YOLO_MODE",
+        "HERMES_ACCEPT_HOOKS",
+        "HERMES_ISOLATED_ONESHOT",
+    )
+    before = {key: f"before-{key}" for key in keys}
+    for key, value in before.items():
+        monkeypatch.setenv(key, value)
+
+    from hermes_cli import oneshot
+    monkeypatch.setattr(
+        sys.modules["hermes_cli.tools_config"],
+        "_get_platform_tools",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def inference(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"final_response": "fixture"}
+
+    assert oneshot.run_oneshot("isolated", inference_runner=inference, **_isolated_kwargs(skill)) == 0
+    assert oneshot.run_oneshot(
+        "ordinary",
+        model="ordinary-model",
+        provider="nous",
+        inference_runner=inference,
+    ) == 0
+    assert oneshot.run_oneshot("isolated-again", inference_runner=inference, **_isolated_kwargs(skill)) == 0
+
+    assert [bool(call.get("isolated_oneshot")) for call in captured] == [True, False, True]
+    assert {key: os.environ.get(key) for key in keys} == before
+
+
+def test_environment_is_restored_when_isolated_inference_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     skill = _write_skill(tmp_path / "release")
     captured: dict[str, object] = {}
-
-    class GateAgent:
-        def __init__(self, **kwargs: object) -> None:
-            assert os.environ.get("HERMES_ISOLATED_ONESHOT") == "1"
-            captured["agent_kwargs"] = kwargs
-
-        def run_conversation(self, prompt: str, **kwargs: object) -> dict[str, object]:
-            return {"final_response": "ok"}
-
     _install_fake_agent_stack(monkeypatch, captured)
-    monkeypatch.setitem(sys.modules, "run_agent", _module("run_agent", AIAgent=GateAgent))
+    before = {
+        "HERMES_NO_DOTENV": "sentinel-no-dotenv",
+        "HERMES_SAFE_MODE": "sentinel-safe",
+        "HERMES_YOLO_MODE": "sentinel-yolo",
+        "HERMES_ACCEPT_HOOKS": "sentinel-hooks",
+    }
+    for key, value in before.items():
+        monkeypatch.setenv(key, value)
 
-    from hermes_cli.oneshot import _run_agent
+    from hermes_cli import oneshot
 
-    _run_agent("prompt", **_isolated_kwargs(skill))
-    assert captured["agent_kwargs"]["enabled_toolsets"] == []
+    def fail(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("fixture inference failure")
 
-
-def test_isolated_model_tools_import_skips_builtin_and_plugin_discovery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tools.registry as registry
-
-    builtin_calls: list[bool] = []
-    plugin_calls: list[bool] = []
-    monkeypatch.setattr(registry, "discover_builtin_tools", lambda: builtin_calls.append(True))
-    monkeypatch.setitem(
-        sys.modules,
-        "hermes_cli.plugins",
-        _module("hermes_cli.plugins", discover_plugins=lambda: plugin_calls.append(True)),
-    )
-    monkeypatch.setenv("HERMES_ISOLATED_ONESHOT", "1")
-    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
-
-    import model_tools  # noqa: F401
-
-    assert builtin_calls == []
-    assert plugin_calls == []
+    assert oneshot.run_oneshot(
+        "isolated",
+        inference_runner=fail,
+        **_isolated_kwargs(skill),
+    ) == 1
+    assert {key: os.environ.get(key) for key in before} == before
 
 
 @pytest.mark.parametrize("module_name", ["hermes_cli.main", "run_agent"])
@@ -290,7 +436,6 @@ def test_real_isolated_agent_skips_context_construction_and_reaches_fake_inferen
         "hermes_cli.tools_config",
         _module("hermes_cli.tools_config", _get_platform_tools=lambda *_a, **_k: []),
     )
-    monkeypatch.setenv("HERMES_ISOLATED_ONESHOT", "1")
     monkeypatch.setenv("HERMES_NO_DOTENV", "1")
     monkeypatch.delitem(sys.modules, "run_agent", raising=False)
 
