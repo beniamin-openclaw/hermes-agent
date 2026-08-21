@@ -4107,6 +4107,20 @@ class AIAgent:
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
+        if getattr(self, "isolated_oneshot", False):
+            # Isolated turns have no shared primary client to seed. Copy the
+            # immutable request configuration once and build exactly one
+            # request-local client; the interruptible call owns its close.
+            with self._openai_client_lock():
+                request_kwargs = dict(self._client_kwargs)
+            request_kwargs["max_retries"] = 0
+            if (
+                base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
+                and self._api_kwargs_have_image_parts(api_kwargs or {})
+            ):
+                request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
+            return self._create_openai_client(request_kwargs, reason=reason, shared=False)
+
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
             return primary_client

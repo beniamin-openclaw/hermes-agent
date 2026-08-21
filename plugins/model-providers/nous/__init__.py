@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from agent.portal_tags import nous_portal_tags
+from agent.portal_tags import nous_request_policy
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -13,7 +13,12 @@ class NousProfile(ProviderProfile):
     def build_extra_body(
         self, *, session_id: str | None = None, **context
     ) -> dict[str, Any]:
-        return {"tags": nous_portal_tags()}
+        policy = nous_request_policy(
+            model=context.get("model"),
+            reasoning_config=context.get("reasoning_config"),
+            supports_reasoning=context.get("supports_reasoning", True),
+        )
+        return {"tags": policy["tags"]}
 
     def build_api_kwargs_extras(
         self,
@@ -23,17 +28,16 @@ class NousProfile(ProviderProfile):
         **context,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Nous: passes full reasoning_config, but OMITS when disabled."""
-        extra_body = {}
-        if supports_reasoning:
-            if reasoning_config is not None:
-                rc = dict(reasoning_config)
-                if rc.get("enabled") is False:
-                    pass  # Nous omits reasoning when disabled
-                else:
-                    extra_body["reasoning"] = rc
-            else:
-                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
-        return extra_body, {}
+        policy = nous_request_policy(
+            model=context.get("model"),
+            reasoning_config=reasoning_config,
+            supports_reasoning=supports_reasoning,
+        )
+        reasoning = policy["reasoning"]
+        return ({"reasoning": reasoning} if reasoning is not None else {}), {}
+
+    def get_max_tokens(self, model: str | None) -> int | None:
+        return nous_request_policy(model=model)["max_tokens"]
 
 
 nous = NousProfile(

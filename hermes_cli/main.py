@@ -65,21 +65,50 @@ import os
 import sys
 
 
-def _disable_dotenv_for_early_oneshot(argv: list[str] | None = None) -> None:
-    """Disable dotenv loading before importing the env loader on request."""
+def _isolated_oneshot_no_dotenv_requested(argv: list[str] | None = None) -> bool:
+    """Return whether argv requests the isolated one-shot dotenv gate."""
     values = sys.argv[1:] if argv is None else argv
     has_oneshot = any(
         value in {"-z", "--oneshot"} or value.startswith("--oneshot=")
         for value in values
     )
-    if has_oneshot and any(
+    return has_oneshot and any(
         value == "--no-dotenv" or value.startswith("--no-dotenv=")
         for value in values
-    ):
-        os.environ["HERMES_NO_DOTENV"] = "1"
+    )
 
 
-_disable_dotenv_for_early_oneshot()
+def _load_project_dotenv_with_early_gate(
+    *,
+    project_env=None,
+    argv: list[str] | None = None,
+    load_fn=None,
+):
+    """Load dotenv while scoping the pre-parse isolated-mode override.
+
+    ``hermes_cli.env_loader`` reads ``HERMES_NO_DOTENV`` at import/call time,
+    so the override must exist before that import. It is nevertheless a
+    bootstrap detail, not process state: restore the caller's exact value as
+    soon as the loader returns (or raises).
+    """
+    key = "HERMES_NO_DOTENV"
+    had_value = key in os.environ
+    previous_value = os.environ.get(key)
+    if _isolated_oneshot_no_dotenv_requested(argv):
+        os.environ[key] = "1"
+    try:
+        if load_fn is None:
+            from hermes_cli.env_loader import load_hermes_dotenv as load_fn
+
+        kwargs = {}
+        if project_env is not None:
+            kwargs["project_env"] = project_env
+        return load_fn(**kwargs)
+    finally:
+        if had_value:
+            os.environ[key] = previous_value
+        else:
+            os.environ.pop(key, None)
 
 
 def _set_process_title() -> None:
@@ -533,9 +562,8 @@ _apply_profile_override()
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
-from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+_load_project_dotenv_with_early_gate(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at

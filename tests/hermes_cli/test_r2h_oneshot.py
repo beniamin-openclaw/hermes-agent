@@ -205,10 +205,14 @@ def _fake_chat_response(text: str = "isolated response") -> types.SimpleNamespac
     )
 
 
-def _install_fake_provider(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+def _install_fake_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[object]]:
     import run_agent
 
     requests: list[dict[str, object]] = []
+    constructions: list[dict[str, object]] = []
+    closes: list[object] = []
 
     class FakeCompletions:
         def create(self, **kwargs: object) -> types.SimpleNamespace:
@@ -216,14 +220,16 @@ def _install_fake_provider(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, ob
             return _fake_chat_response()
 
     class FakeOpenAI:
-        def __init__(self, **_kwargs: object) -> None:
+        def __init__(self, **kwargs: object) -> None:
+            constructions.append(kwargs)
             self.chat = types.SimpleNamespace(completions=FakeCompletions())
 
         def close(self) -> None:
+            closes.append(self)
             return None
 
     monkeypatch.setattr(run_agent, "OpenAI", FakeOpenAI)
-    return requests
+    return requests, constructions, closes
 
 
 @pytest.mark.parametrize("oneshot_imports_first", [False, True])
@@ -246,7 +252,7 @@ def test_real_isolated_run_conversation_uses_one_fake_transport_request(
         run_agent = importlib.import_module("run_agent")
         importlib.import_module("hermes_cli.oneshot")
 
-    requests = _install_fake_provider(monkeypatch)
+    requests, constructions, closes = _install_fake_provider(monkeypatch)
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("isolated run reached a forbidden subsystem")
@@ -285,11 +291,194 @@ def test_real_isolated_run_conversation_uses_one_fake_transport_request(
     assert result["completed"] is True
     assert result["api_calls"] == 1
     assert len(requests) == 1
+    assert len(constructions) == 1
+    assert len(closes) == 1
     assert "tools" not in requests[0] or requests[0]["tools"] in (None, [])
     assert agent.tools == []
     assert agent._session_db is None
     assert agent.context_compressor is None
     assert os.environ.get("HERMES_ISOLATED_ONESHOT") is None
+
+
+def test_main_early_dotenv_gate_restores_caller_state_between_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import main
+
+    observed: list[str | None] = []
+
+    def fake_load(**_kwargs: object) -> list[str]:
+        observed.append(os.environ.get("HERMES_NO_DOTENV"))
+        return []
+
+    monkeypatch.delenv("HERMES_NO_DOTENV", raising=False)
+    main._load_project_dotenv_with_early_gate(
+        argv=["-z", "prompt", "--no-dotenv"],
+        load_fn=fake_load,
+    )
+    assert observed[-1] == "1"
+    assert "HERMES_NO_DOTENV" not in os.environ
+
+    main._load_project_dotenv_with_early_gate(argv=["chat"], load_fn=fake_load)
+    assert observed[-1] is None
+    assert "HERMES_NO_DOTENV" not in os.environ
+
+    monkeypatch.setenv("HERMES_NO_DOTENV", "caller-value")
+    main._load_project_dotenv_with_early_gate(
+        argv=["-z", "prompt", "--no-dotenv"],
+        load_fn=fake_load,
+    )
+    assert observed[-1] == "1"
+    assert os.environ["HERMES_NO_DOTENV"] == "caller-value"
+
+
+def test_isolated_rejects_non_chat_runtime_before_agent_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill = _write_skill(tmp_path / "release")
+    captured: dict[str, object] = {}
+    _install_fake_agent_stack(monkeypatch, captured)
+
+    runtime_provider = sys.modules["hermes_cli.runtime_provider"]
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "fixture-key",
+            "base_url": "https://fixture.invalid/v1",
+            "provider": "nous",
+            "api_mode": "codex_responses",
+            "credential_pool": None,
+        },
+    )
+
+    class MustNotConstruct:
+        def __init__(self, **_kwargs: object) -> None:
+            raise AssertionError("non-chat isolated mode constructed an agent")
+
+    monkeypatch.setitem(sys.modules, "run_agent", _module("run_agent", AIAgent=MustNotConstruct))
+
+    from hermes_cli import oneshot
+
+    with pytest.raises(RuntimeError, match="requires api_mode chat_completions"):
+        oneshot._run_agent("prompt", **_isolated_kwargs(skill))
+
+
+def test_isolated_nous_request_policy_matches_profile_without_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import run_agent
+    from agent import agent_init, conversation_loop
+    import providers
+
+    requests, constructions, closes = _install_fake_provider(monkeypatch)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("isolated run reached discovery or context setup")
+
+    monkeypatch.setattr(providers, "_discover_providers", forbidden)
+    monkeypatch.setattr(agent_init, "ContextCompressor", forbidden)
+    monkeypatch.setattr(agent_init, "StreamingContextScrubber", forbidden)
+    monkeypatch.setattr(conversation_loop, "build_turn_context", forbidden)
+    monkeypatch.setattr(conversation_loop, "_restore_or_build_system_prompt", forbidden)
+
+    agent = run_agent.AIAgent(
+        api_key="fixture-key",
+        base_url="https://inference.nousresearch.com/v1",
+        provider="nous",
+        api_mode="chat_completions",
+        model="anthropic/claude-sonnet-4.6",
+        fallback_model=[],
+        session_db=None,
+        skip_context_files=True,
+        skip_memory=True,
+        isolated_oneshot=True,
+    )
+
+    result = agent.run_conversation("review prompt", system_message="static skill")
+
+    from agent.anthropic_adapter import _get_anthropic_max_output
+    from agent.portal_tags import nous_portal_tags
+
+    assert result["completed"] is True
+    assert len(requests) == len(constructions) == len(closes) == 1
+    assert requests[0]["extra_body"]["tags"] == nous_portal_tags()
+    assert requests[0]["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
+    assert requests[0]["max_tokens"] == _get_anthropic_max_output("anthropic/claude-sonnet-4.6")
+
+
+@pytest.mark.parametrize("response_shape", ["whitespace", "missing_content"])
+def test_isolated_empty_normalized_response_is_failed_with_usage_receipt(
+    tmp_path: Path,
+    response_shape: str,
+) -> None:
+    from agent import conversation_loop
+
+    usage = types.SimpleNamespace(prompt_tokens=11, completion_tokens=5, total_tokens=16)
+    if response_shape == "whitespace":
+        normalized = types.SimpleNamespace(content=" \n\t ", tool_calls=None, usage=usage, reasoning=None)
+    else:
+        normalized = types.SimpleNamespace(tool_calls=None, usage=usage, reasoning=None)
+
+    class FakeTransport:
+        def build_kwargs(self, **kwargs: object) -> dict[str, object]:
+            return kwargs
+
+        def normalize_response(self, _response: object) -> object:
+            return normalized
+
+    class FakeAgent:
+        isolated_oneshot = True
+        provider = "nous"
+        api_mode = "chat_completions"
+        model = "pinned-model"
+        base_url = "https://fixture.invalid/v1"
+        reasoning_config = None
+        max_tokens = None
+        request_overrides: dict[str, object] = {}
+        session_id = "fixture-session"
+        tools: list[object] = []
+
+        def _get_transport(self) -> FakeTransport:
+            return FakeTransport()
+
+        def _resolved_api_call_timeout(self) -> float:
+            return 30.0
+
+        def _max_tokens_param(self, value: int) -> dict[str, int]:
+            return {"max_tokens": value}
+
+        def _interruptible_api_call(self, _kwargs: dict[str, object]) -> object:
+            return object()
+
+        def _strip_think_blocks(self, content: str) -> str:
+            return content
+
+        def _touch_activity(self, _description: str) -> None:
+            return None
+
+    result = conversation_loop.run_conversation(FakeAgent(), "prompt")
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["error"] == "isolated_empty_response"
+    assert result["provider"] == "nous"
+    assert result["model"] == "pinned-model"
+    assert result["input_tokens"] == 11
+    assert result["output_tokens"] == 5
+    assert result["total_tokens"] == 16
+
+    usage_file = tmp_path / "usage.json"
+    from hermes_cli.oneshot import _write_usage_file
+
+    _write_usage_file(str(usage_file), result)
+    report = json.loads(usage_file.read_text(encoding="utf-8"))
+    assert report["completed"] is False
+    assert report["failed"] is True
+    assert report["failure"] == "isolated_empty_response"
+    assert report["provider"] == "nous"
+    assert report["model"] == "pinned-model"
+    assert report["total_tokens"] == 16
 
 
 def test_isolation_is_per_call_and_environment_is_restored(

@@ -68,6 +68,8 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+_ISOLATED_EMPTY_RESPONSE_ERROR = "isolated_empty_response"
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -524,82 +526,82 @@ def _run_isolated_single_turn(
     """Run exactly one toolless request through the normal provider seam.
 
     Isolated review one-shots deliberately bypass the ordinary turn prologue
-    and loop. The request is still built by ``AIAgent._build_api_kwargs`` and
-    sent by ``AIAgent._interruptible_api_call`` so provider-specific request
-    construction, client creation, and response normalization remain shared
-    with Hermes rather than being reimplemented here.
+    and loop. The request is built by the resolved chat transport and sent by
+    ``AIAgent._interruptible_api_call`` so provider-specific response
+    normalization and client construction remain shared with Hermes.
     """
+    if agent.api_mode != "chat_completions":
+        raise RuntimeError(
+            "hermes -z: isolated review-system requires api_mode chat_completions"
+        )
+
     messages: List[Dict[str, Any]] = []
     if system_message:
         messages.append({"role": "system", "content": system_message})
     messages.append({"role": "user", "content": user_message})
 
     transport = agent._get_transport()
-    if agent.api_mode == "chat_completions":
-        # Do not call AIAgent._build_api_kwargs here: that ordinary helper
-        # intentionally lazy-discovers bundled and user provider plugins.
-        # The isolated contract uses the same resolved transport's generic
-        # provider-faithful builder with discovery-free route flags.
-        base_url_lower = (agent.base_url or "").lower()
-        api_kwargs = transport.build_kwargs(
-            model=agent.model,
-            messages=messages,
-            tools=[],
-            base_url=agent.base_url,
-            timeout=agent._resolved_api_call_timeout(),
-            max_tokens=agent.max_tokens,
-            ephemeral_max_output_tokens=None,
-            max_tokens_param_fn=agent._max_tokens_param,
-            reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
-            session_id=agent.session_id,
-            model_lower=(agent.model or "").lower(),
-            is_openrouter="openrouter.ai" in base_url_lower,
-            is_nous=(agent.provider == "nous" or "nousresearch" in base_url_lower),
-            is_qwen_portal=False,
-            is_github_models=False,
-            is_nvidia_nim=False,
-            is_kimi=False,
-            is_tokenhub=False,
-            is_lmstudio=False,
-            is_custom_provider=agent.provider == "custom",
-            ollama_num_ctx=None,
-            provider_preferences=None,
-            openrouter_min_coding_score=None,
-            qwen_prepare_fn=None,
-            qwen_prepare_inplace_fn=None,
-            qwen_session_metadata=None,
-            fixed_temperature=None,
-            omit_temperature=False,
-            supports_reasoning=False,
-            github_reasoning_extra=None,
-            lmstudio_reasoning_options=None,
-            anthropic_max_output=None,
-            provider_name=agent.provider,
-        )
-    else:
-        # Non-chat transports own their protocol-specific request shape; they
-        # are still resolved through Hermes' transport registry and never via
-        # an isolated duplicate client or loop.
-        api_kwargs = transport.build_kwargs(
-            model=agent.model,
-            messages=messages,
-            tools=[],
-            reasoning_config=agent.reasoning_config,
-            session_id=agent.session_id,
-            max_tokens=agent.max_tokens,
-            timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
-        )
+    # Do not call AIAgent._build_api_kwargs here: that ordinary helper
+    # intentionally lazy-discovers bundled and user provider plugins. The
+    # isolated contract uses the same resolved transport's generic builder
+    # with the discovery-free Nous policy.
+    from agent.portal_tags import nous_request_policy
+
+    policy = nous_request_policy(
+        model=agent.model,
+        reasoning_config=agent.reasoning_config,
+        supports_reasoning=True,
+    )
+    policy_extra_body = {"tags": policy["tags"]}
+    if policy["reasoning"] is not None:
+        policy_extra_body["reasoning"] = policy["reasoning"]
+    api_kwargs = transport.build_kwargs(
+        model=agent.model,
+        messages=messages,
+        tools=[],
+        base_url=agent.base_url,
+        timeout=agent._resolved_api_call_timeout(),
+        max_tokens=agent.max_tokens,
+        ephemeral_max_output_tokens=None,
+        max_tokens_param_fn=agent._max_tokens_param,
+        reasoning_config=None,
+        request_overrides=agent.request_overrides,
+        session_id=agent.session_id,
+        model_lower=(agent.model or "").lower(),
+        is_openrouter=False,
+        is_nous=True,
+        is_qwen_portal=False,
+        is_github_models=False,
+        is_nvidia_nim=False,
+        is_kimi=False,
+        is_tokenhub=False,
+        is_lmstudio=False,
+        is_custom_provider=False,
+        ollama_num_ctx=None,
+        provider_preferences=None,
+        openrouter_min_coding_score=None,
+        qwen_prepare_fn=None,
+        qwen_prepare_inplace_fn=None,
+        qwen_session_metadata=None,
+        fixed_temperature=None,
+        omit_temperature=False,
+        supports_reasoning=False,
+        github_reasoning_extra=None,
+        lmstudio_reasoning_options=None,
+        anthropic_max_output=policy["max_tokens"],
+        extra_body_additions=policy_extra_body,
+        provider_name="nous",
+    )
     response = agent._interruptible_api_call(api_kwargs)
     if response is None:
         raise RuntimeError("isolated one-shot provider returned no response")
 
     normalized = transport.normalize_response(response)
-    if normalized.tool_calls:
+    if getattr(normalized, "tool_calls", None):
         raise RuntimeError("isolated one-shot provider returned tool calls")
 
-    content = normalized.content or ""
+    raw_content = getattr(normalized, "content", None)
+    content = raw_content or ""
     if not isinstance(content, str):
         content = str(content)
     content = agent._strip_think_blocks(content).strip()
@@ -607,7 +609,7 @@ def _run_isolated_single_turn(
     messages.append(assistant_message)
 
     usage = normalize_usage(
-        normalized.usage,
+        getattr(normalized, "usage", None),
         provider=agent.provider,
         api_mode=agent.api_mode,
     )
@@ -624,16 +626,23 @@ def _run_isolated_single_turn(
     agent.session_completion_tokens = usage.output_tokens
     agent.session_total_tokens = agent.session_prompt_tokens + usage.output_tokens
     agent._session_messages = messages
-    agent._touch_activity("isolated one-shot completed")
+    is_empty_response = not content
+    agent._touch_activity(
+        "isolated one-shot empty response"
+        if is_empty_response
+        else "isolated one-shot completed"
+    )
 
     return {
         "final_response": content,
-        "last_reasoning": normalized.reasoning,
+        "last_reasoning": getattr(normalized, "reasoning", None),
         "messages": messages,
         "api_calls": 1,
-        "completed": True,
-        "turn_exit_reason": "isolated_single_turn",
-        "failed": False,
+        "completed": not is_empty_response,
+        "turn_exit_reason": (
+            "isolated_empty_response" if is_empty_response else "isolated_single_turn"
+        ),
+        "failed": is_empty_response,
         "partial": False,
         "interrupted": False,
         "response_transformed": False,
@@ -654,7 +663,10 @@ def _run_isolated_single_turn(
         "cost_status": "unknown",
         "cost_source": "none",
         "session_id": agent.session_id,
+        **({"error": _ISOLATED_EMPTY_RESPONSE_ERROR} if is_empty_response else {}),
     }
+
+
 def run_conversation(
     agent,
     user_message: str,

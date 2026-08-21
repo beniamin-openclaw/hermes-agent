@@ -437,8 +437,11 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "completed": result.get("completed"),
             "failed": bool(result.get("failed")) or failure is not None,
         }
+        result_failure = result.get("error")
         if failure is not None:
             report["failure"] = failure
+        elif result_failure is not None:
+            report["failure"] = result_failure
         out = Path(path).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -740,6 +743,10 @@ def _run_agent(
             raise RuntimeError("hermes -z: effective provider does not match requested provider")
         if effective_model != (model or "").strip():
             raise RuntimeError("hermes -z: effective model does not match requested model")
+        if runtime.get("api_mode") != "chat_completions":
+            raise RuntimeError(
+                "hermes -z: isolated review-system requires api_mode chat_completions"
+            )
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
